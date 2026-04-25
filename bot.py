@@ -3,7 +3,8 @@ import discord, asyncio, json, threading, time, requests, joblib
 from flask import Flask, request
 from datetime import datetime
 
-TOKEN = "MTQ5Njg3NzA1ODgxMzQ2NDc0OQ.GpZX1R.3MiY2lFoP4TvB8OX95oMINb8AyY7nDHBqQOAJA"
+import os
+TOKEN = os.environ.get("DISCORD_TOKEN")
 CHANNEL_ID = 1496879851037261847  # replace with your channel ID
 
 LOG_FILE = "trades_log.json"
