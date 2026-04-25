@@ -3,7 +3,7 @@ import discord, asyncio, json, threading, time, requests, joblib
 from flask import Flask, request
 from datetime import datetime
 
-TOKEN = "MTQ5Njg3NzA1ODgxMzQ2NDc0OQ.GmMsk1.uGYbJRojjpIdfgGpYib9b8-CEOsJHSnhVMCgTI"
+TOKEN = "MTQ5Njg3NzA1ODgxMzQ2NDc0OQ.GpZX1R.3MiY2lFoP4TvB8OX95oMINb8AyY7nDHBqQOAJA"
 CHANNEL_ID = 1496879851037261847  # replace with your channel ID
 
 LOG_FILE = "trades_log.json"
@@ -179,7 +179,9 @@ def monitor():
 async def on_ready():
     print("Bot is running")
 
-threading.Thread(target=lambda: app.run(host="0.0.0.0", port=5000)).start()
+threading.Thread(target=lambda: import os
+port = int(os.environ.get("PORT", 5000))
+app.run(host="0.0.0.0", port=port)).start()
 threading.Thread(target=monitor).start()
 try:
     client.run(TOKEN)
