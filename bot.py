@@ -114,6 +114,7 @@ def log_trade(data, score, features):
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.json
+    print("WEBHOOK RECEIVED:", data)
 
     score = evaluate_trade(data)
     features = build_features(data)
@@ -121,6 +122,7 @@ def webhook():
     model = load_model()
     prob = ml_predict(model, features, score)
 
+    decision = "RULE ONLY"
     if prob:
         if prob > 0.7:
             decision = "🔥 STRONG"
@@ -128,8 +130,6 @@ def webhook():
             decision = "✅ TAKE"
         else:
             decision = "❌ SKIP"
-    else:
-        decision = "RULE ONLY"
 
     log_trade(data, score, features)
 
@@ -142,8 +142,14 @@ ML Prob: {round(prob*100,2) if prob else "N/A"}%
 Decision: {decision}
 """
 
+    print("SENDING TO DISCORD...")
+
     ch = client.get_channel(CHANNEL_ID)
-    asyncio.run_coroutine_threadsafe(ch.send(msg), client.loop)
+    if ch is None:
+        print("❌ CHANNEL NOT FOUND")
+    else:
+        asyncio.run_coroutine_threadsafe(ch.send(msg), client.loop)
+        print("✅ MESSAGE SENT")
 
     return "ok"
 
