@@ -176,15 +176,17 @@ def monitor():
         json.dump(trades, open(LOG_FILE, "w"), indent=2)
         time.sleep(10)
 
+import os
+
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+
 @client.event
 async def on_ready():
     print("Bot is running")
 
-threading.Thread(target=lambda: import os
-port = int(os.environ.get("PORT", 5000))
-app.run(host="0.0.0.0", port=port)).start()
+threading.Thread(target=run_flask).start()
 threading.Thread(target=monitor).start()
-try:
-    client.run(TOKEN)
-except Exception as e:
-    print("ERROR:", e)
+
+client.run(TOKEN)
