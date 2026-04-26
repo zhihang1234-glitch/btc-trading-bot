@@ -15,7 +15,7 @@ from datetime import datetime
 # ===== CONFIG =====
 TOKEN = os.environ.get("DISCORD_TOKEN")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "1496879851037261847"))
-DATABASE_URL = os.environ.get("DATABASE_URL")  # Set this in Railway
+DATABASE_URL = os.environ.get("DATABASE_URL")
 MODEL_FILE = "model.pkl"
 PORT = int(os.environ.get("PORT", 5000))
 
@@ -23,8 +23,6 @@ app = Flask(__name__)
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
-
-file_lock = threading.Lock()
 
 # ===== DATABASE =====
 def get_conn():
@@ -56,7 +54,7 @@ def log_trade(data, score, features):
     if signal == "LONG":
         sl = entry * 0.995
         tp = entry * 1.01
-    else:  # SHORT
+    else:
         sl = entry * 1.005
         tp = entry * 0.99
 
@@ -80,7 +78,7 @@ def update_trade_status(trade_id, status):
             cur.execute("UPDATE trades SET status = %s WHERE id = %s", (status, trade_id))
         conn.commit()
 
-# ===== MODEL (cached at startup) =====
+# ===== MODEL =====
 model = None
 
 def load_model():
@@ -101,54 +99,70 @@ def get_price():
         print(f"❌ Price fetch failed: {e}")
         return None
 
+# ===== SAFE FLOAT =====
+def safe_float(val):
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
 # ===== RULE SCORE =====
 def evaluate_trade(data):
-    price = float(data["price"])
-    ema9 = float(data["ema9"])
-    ema21 = float(data["ema21"])
-    vwap = float(data["vwap"])
-    volume = float(data["volume"])
-    signal = data["signal"]
+    price = safe_float(data.get("price"))
+    ema9 = safe_float(data.get("ema9"))
+    ema21 = safe_float(data.get("ema21"))
+    vwap = safe_float(data.get("vwap"))
+    volume = safe_float(data.get("volume"))
+    signal = data.get("signal", "")
+
+    if price is None:
+        return 50
 
     score = 50
 
-    if (signal == "LONG" and ema9 > ema21) or (signal == "SHORT" and ema9 < ema21):
-        score += 20
+    if ema9 is not None and ema21 is not None:
+        if (signal == "LONG" and ema9 > ema21) or (signal == "SHORT" and ema9 < ema21):
+            score += 20
 
-    if abs(price - vwap) / vwap < 0.004:
-        score += 15
+    if vwap is not None:
+        if abs(price - vwap) / vwap < 0.004:
+            score += 15
+        if (signal == "LONG" and price > vwap) or (signal == "SHORT" and price < vwap):
+            score += 20
 
-    if abs(price - ema21) / ema21 < 0.003:
-        score += 15
+    if ema21 is not None:
+        if abs(price - ema21) / ema21 < 0.003:
+            score += 15
 
-    if volume > 0:
+    if volume is not None and volume > 0:
         score += 10
-
-    if (signal == "LONG" and price > vwap) or (signal == "SHORT" and price < vwap):
-        score += 20
 
     return min(100, score)
 
 # ===== FEATURES =====
 def build_features(data):
-    price = float(data["price"])
-    ema9 = float(data["ema9"])
-    ema21 = float(data["ema21"])
-    vwap = float(data["vwap"])
-    volume = float(data["volume"])
-    signal = data["signal"]
+    price = safe_float(data.get("price"))
+    ema9 = safe_float(data.get("ema9"))
+    ema21 = safe_float(data.get("ema21"))
+    vwap = safe_float(data.get("vwap"))
+    volume = safe_float(data.get("volume"))
+    signal = data.get("signal", "")
 
     return {
-        "trend": ema9 > ema21,
-        "vwap_ok": abs(price - vwap) / vwap < 0.004,
-        "pullback": abs(price - ema21) / ema21 < 0.003,
-        "volume_nonzero": volume > 0,
-        "direction": (signal == "LONG" and price > vwap) or (signal == "SHORT" and price < vwap)
+        "trend": (ema9 > ema21) if (ema9 is not None and ema21 is not None) else None,
+        "vwap_ok": (abs(price - vwap) / vwap < 0.004) if (price and vwap) else None,
+        "pullback": (abs(price - ema21) / ema21 < 0.003) if (price and ema21) else None,
+        "volume_nonzero": (volume > 0) if volume is not None else None,
+        "direction": (
+            (signal == "LONG" and price > vwap) or (signal == "SHORT" and price < vwap)
+        ) if (price and vwap) else None
     }
 
 # ===== ML =====
 def ml_predict(features, score):
     if model is None:
+        return None
+    if any(v is None for v in features.values()):
         return None
     X = [[
         int(features["trend"]),
@@ -163,7 +177,18 @@ def ml_predict(features, score):
 # ===== WEBHOOK =====
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(force=True)
+    raw = request.get_data(as_text=True)
+    print("RAW BODY:", raw)
+
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        print(f"❌ JSON parse error: {e}")
+        return "bad request", 400
+
+    if not data:
+        return "empty", 400
+
     print("WEBHOOK RECEIVED:", data)
 
     score = evaluate_trade(data)
@@ -179,14 +204,19 @@ def webhook():
     else:
         decision = "❌ SKIP"
 
+    indicator_note = ""
+    if safe_float(data.get("ema9")) is None:
+        indicator_note = "\n⚠️ _Indicators not resolved — score based on price only_"
+
     log_trade(data, score, features)
 
     msg = (
         f"📊 **TRADE SIGNAL**\n"
-        f"**{data['signal']}** @ `{data['price']}`\n\n"
+        f"**{data.get('signal')}** @ `{data.get('price')}`\n\n"
         f"Score: `{score}/100`\n"
         f"ML Prob: `{round(prob * 100, 2) if prob else 'N/A'}%`\n"
         f"Decision: {decision}"
+        f"{indicator_note}"
     )
 
     print("SENDING TO DISCORD...")
