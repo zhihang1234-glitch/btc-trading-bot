@@ -163,7 +163,7 @@ def ml_predict(features, score):
 # ===== WEBHOOK =====
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
+    data = request.get_json(force=True)
     print("WEBHOOK RECEIVED:", data)
 
     score = evaluate_trade(data)
