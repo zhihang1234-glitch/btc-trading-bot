@@ -14,7 +14,7 @@ from datetime import datetime
 
 # ===== CONFIG =====
 TOKEN = os.environ.get("DISCORD_TOKEN")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "1496879851037261847"))
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "1497320466715775080"))
 DATABASE_URL = os.environ.get("DATABASE_URL")
 MODEL_FILE = "model.pkl"
 PORT = int(os.environ.get("PORT", 5000))
