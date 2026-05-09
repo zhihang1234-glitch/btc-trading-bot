@@ -1,0 +1,8 @@
+discord.py
+flask
+requests
+joblib
+scikit-learn
+psycopg2-binary
+pandas
+numpy
