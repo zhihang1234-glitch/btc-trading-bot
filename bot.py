@@ -45,7 +45,7 @@ def init_db():
                     features JSONB
                 )
             """)
-        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS atr FLOAT")
+            cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS atr FLOAT")
         conn.commit()
     print("✅ DB initialized")
 
