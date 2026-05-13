@@ -1,17 +1,65 @@
 import time
 import requests
 import pandas as pd
-import numpy as np
 import os
+import psycopg2
+import psycopg2.extras
 from datetime import datetime, timezone
 
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "http://localhost:8080/webhook")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 SYMBOL = "BTC-USD"
 GRANULARITY = 3600  # 1 hour candles
-CANDLE_LIMIT = 100  # enough for ATR(14), EMA(21)
 COOLDOWN_SECONDS = 4 * 3600  # 4 hours
 
-last_signal_time = {"LONG": 0, "SHORT": 0}
+# ===== DB COOLDOWN =====
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+def init_cooldown_table():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cooldowns (
+                    signal TEXT PRIMARY KEY,
+                    last_fired TIMESTAMP
+                )
+            """)
+            # ensure rows exist
+            cur.execute("""
+                INSERT INTO cooldowns (signal, last_fired)
+                VALUES ('LONG', '2000-01-01'), ('SHORT', '2000-01-01')
+                ON CONFLICT (signal) DO NOTHING
+            """)
+        conn.commit()
+    print("✅ Cooldown table ready")
+
+def is_on_cooldown(signal):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT last_fired FROM cooldowns WHERE signal = %s", (signal,))
+            row = cur.fetchone()
+            if not row:
+                return False
+            last_fired = row[0].replace(tzinfo=timezone.utc)
+            elapsed = (datetime.now(timezone.utc) - last_fired).total_seconds()
+            remaining = COOLDOWN_SECONDS - elapsed
+            if remaining > 0:
+                hours = int(remaining // 3600)
+                mins = int((remaining % 3600) // 60)
+                print(f"⏳ {signal} cooldown: {hours}h {mins}m remaining")
+                return True
+            return False
+
+def set_cooldown(signal):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO cooldowns (signal, last_fired)
+                VALUES (%s, NOW())
+                ON CONFLICT (signal) DO UPDATE SET last_fired = NOW()
+            """, (signal,))
+        conn.commit()
 
 # ===== FETCH CANDLES =====
 def get_candles():
@@ -29,15 +77,12 @@ def get_candles():
 
 # ===== INDICATORS =====
 def calculate_indicators(df):
-    # EMA
     df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
     df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
 
-    # VWAP (rolling daily approximation over all candles)
-    df["tp"] = (df["high"] + df["low"] + df["close"]) / 3
-    df["vwap"] = (df["tp"] * df["volume"]).cumsum() / df["volume"].cumsum()
+    df["tp_price"] = (df["high"] + df["low"] + df["close"]) / 3
+    df["vwap"] = (df["tp_price"] * df["volume"]).cumsum() / df["volume"].cumsum()
 
-    # ATR(14)
     df["prev_close"] = df["close"].shift(1)
     df["tr"] = df[["high", "low", "prev_close"]].apply(
         lambda row: max(
@@ -53,7 +98,6 @@ def calculate_indicators(df):
 # ===== SIGNAL CHECK =====
 def check_signals(df):
     latest = df.iloc[-1]
-    prev = df.iloc[-2]
 
     close = latest["close"]
     ema9 = latest["ema9"]
@@ -62,16 +106,20 @@ def check_signals(df):
     volume = latest["volume"]
     atr = latest["atr"]
 
+    # Guard against NaN
+    if any(pd.isna([ema9, ema21, vwap, atr])):
+        return False, False, {}
+
     long_signal = (
         close > vwap and
         ema9 > ema21 and
-        close <= ema21 * 1.003  # within 0.3% of ema21 (pullback)
+        close <= ema21 * 1.003
     )
 
     short_signal = (
         close < vwap and
         ema9 < ema21 and
-        close >= ema21 * 0.997  # within 0.3% of ema21 (pullback)
+        close >= ema21 * 0.997
     )
 
     return long_signal, short_signal, {
@@ -83,18 +131,13 @@ def check_signals(df):
         "atr": round(atr, 2)
     }
 
-# ===== COOLDOWN CHECK =====
-def is_on_cooldown(signal):
-    elapsed = time.time() - last_signal_time[signal]
-    return elapsed < COOLDOWN_SECONDS
-
 # ===== SEND SIGNAL =====
 def send_signal(signal, values):
     payload = {"signal": signal, **values}
     try:
         resp = requests.post(WEBHOOK_URL, json=payload, timeout=5)
         print(f"✅ Signal sent: {signal} @ {values['price']} → {resp.status_code}")
-        last_signal_time[signal] = time.time()
+        set_cooldown(signal)
     except Exception as e:
         print(f"❌ Failed to send signal: {e}")
 
@@ -103,25 +146,32 @@ def main():
     print(f"🔍 Scanner started — checking {SYMBOL} every 60s")
     print(f"📡 Sending signals to: {WEBHOOK_URL}")
 
+    init_cooldown_table()
+
     while True:
         try:
             df = get_candles()
             df = calculate_indicators(df)
             long_signal, short_signal, values = check_signals(df)
 
+            if not values:
+                print("⚠️ Skipping — NaN in indicators")
+                time.sleep(60)
+                continue
+
             now = datetime.now(timezone.utc).strftime("%H:%M:%S")
             print(f"[{now}] price={values['price']} ema9={values['ema9']} ema21={values['ema21']} vwap={values['vwap']} atr={values['atr']}")
 
             if long_signal:
                 if is_on_cooldown("LONG"):
-                    print("⏳ LONG signal skipped — cooldown active")
+                    pass  # message already printed in is_on_cooldown
                 else:
                     print("🟢 LONG signal detected!")
                     send_signal("LONG", values)
 
             elif short_signal:
                 if is_on_cooldown("SHORT"):
-                    print("⏳ SHORT signal skipped — cooldown active")
+                    pass
                 else:
                     print("🔴 SHORT signal detected!")
                     send_signal("SHORT", values)
