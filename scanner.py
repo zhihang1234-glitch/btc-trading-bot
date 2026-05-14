@@ -11,8 +11,8 @@ SYMBOL = "BTC-USD"
 GRANULARITY = 3600  # 1 hour candles
 
 # RSI filter range
-RSI_MIN = 40
-RSI_MAX = 60
+RSI_MIN = 35
+RSI_MAX = 65
 
 # FIX #11: ATR threshold as % of price rather than hardcoded absolute value
 ATR_MIN_PCT = 0.0001  # 0.01% of price — works for any symbol
