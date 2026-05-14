@@ -1,6 +1,4 @@
-# Fixed `scanner.py`
 
-```python
 import time
 import requests
 import pandas as pd
@@ -293,28 +291,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
-
-# What Changed
-
-## Fixed duplicate spam alerts
-
-* Prevents repeated alerts on the same candle.
-
-## Added EMA crossover detection
-
-* Signals only fire on fresh trend transitions.
-
-## Added open trade lock
-
-* Prevents stacking identical open positions.
-
-## Improved signal quality
-
-* No more constant 100/100 spam every minute.
-
-## Kept your architecture intact
-
-* Compatible with your existing `bot.py`
-* Works with your PostgreSQL setup
-* Keeps Discord integration unchanged
