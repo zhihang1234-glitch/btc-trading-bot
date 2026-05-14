@@ -3,20 +3,22 @@ import requests
 import pandas as pd
 import os
 import psycopg2
-import psycopg2.extras
 from datetime import datetime, timezone
 
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "http://localhost:8080/webhook")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 SYMBOL = "BTC-USD"
 GRANULARITY = 3600  # 1 hour candles
-COOLDOWN_SECONDS = 4 * 3600  # 4 hours
 
-# ===== DB COOLDOWN =====
+# RSI filter range — only take signals when RSI is in this band
+RSI_MIN = 40
+RSI_MAX = 60
+
+# ===== DB =====
 def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-def init_cooldown_table():
+def init_db_tables():
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -25,41 +27,8 @@ def init_cooldown_table():
                     last_fired TIMESTAMP
                 )
             """)
-            # ensure rows exist
-            cur.execute("""
-                INSERT INTO cooldowns (signal, last_fired)
-                VALUES ('LONG', '2000-01-01'), ('SHORT', '2000-01-01')
-                ON CONFLICT (signal) DO NOTHING
-            """)
         conn.commit()
-    print("✅ Cooldown table ready")
-
-def is_on_cooldown(signal):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT last_fired FROM cooldowns WHERE signal = %s", (signal,))
-            row = cur.fetchone()
-            if not row:
-                return False
-            last_fired = row[0].replace(tzinfo=timezone.utc)
-            elapsed = (datetime.now(timezone.utc) - last_fired).total_seconds()
-            remaining = COOLDOWN_SECONDS - elapsed
-            if remaining > 0:
-                hours = int(remaining // 3600)
-                mins = int((remaining % 3600) // 60)
-                print(f"⏳ {signal} cooldown: {hours}h {mins}m remaining")
-                return True
-            return False
-
-def set_cooldown(signal):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO cooldowns (signal, last_fired)
-                VALUES (%s, NOW())
-                ON CONFLICT (signal) DO UPDATE SET last_fired = NOW()
-            """, (signal,))
-        conn.commit()
+    print("✅ DB tables ready")
 
 # ===== FETCH CANDLES =====
 def get_candles():
@@ -69,7 +38,6 @@ def get_candles():
     resp.raise_for_status()
     data = resp.json()
 
-    # Coinbase returns [time, low, high, open, close, volume]
     df = pd.DataFrame(data, columns=["time", "low", "high", "open", "close", "volume"])
     df = df.sort_values("time").reset_index(drop=True)
     df = df.astype(float)
@@ -77,12 +45,15 @@ def get_candles():
 
 # ===== INDICATORS =====
 def calculate_indicators(df):
+    # EMA
     df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
     df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
 
+    # VWAP
     df["tp_price"] = (df["high"] + df["low"] + df["close"]) / 3
     df["vwap"] = (df["tp_price"] * df["volume"]).cumsum() / df["volume"].cumsum()
 
+    # ATR(14)
     df["prev_close"] = df["close"].shift(1)
     df["tr"] = df[["high", "low", "prev_close"]].apply(
         lambda row: max(
@@ -92,6 +63,15 @@ def calculate_indicators(df):
         ), axis=1
     )
     df["atr"] = df["tr"].ewm(span=14, adjust=False).mean()
+
+    # RSI(14)
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(span=14, adjust=False).mean()
+    avg_loss = loss.ewm(span=14, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
+    df["rsi"] = 100 - (100 / (1 + rs))
 
     return df
 
@@ -105,21 +85,32 @@ def check_signals(df):
     vwap = latest["vwap"]
     volume = latest["volume"]
     atr = latest["atr"]
+    rsi = latest["rsi"]
 
-    # Guard against NaN
-    if any(pd.isna([ema9, ema21, vwap, atr])):
+    # Guard against NaN or invalid ATR
+    if pd.isna(atr) or atr < 10:
+        print(f"⚠️ Invalid ATR ({atr:.2f}), skipping")
         return False, False, {}
+
+    if pd.isna(rsi):
+        print("⚠️ RSI not ready, skipping")
+        return False, False, {}
+
+    # RSI filter — only trade when RSI is in neutral zone
+    rsi_ok = RSI_MIN <= rsi <= RSI_MAX
 
     long_signal = (
         close > vwap and
         ema9 > ema21 and
-        close <= ema21 * 1.003
+        close <= ema21 * 1.003 and
+        rsi_ok
     )
 
     short_signal = (
         close < vwap and
         ema9 < ema21 and
-        close >= ema21 * 0.997
+        close >= ema21 * 0.997 and
+        rsi_ok
     )
 
     return long_signal, short_signal, {
@@ -128,7 +119,8 @@ def check_signals(df):
         "ema21": round(ema21, 2),
         "vwap": round(vwap, 2),
         "volume": round(volume, 8),
-        "atr": round(atr, 2)
+        "atr": round(atr, 2),
+        "rsi": round(rsi, 2)
     }
 
 # ===== SEND SIGNAL =====
@@ -137,7 +129,6 @@ def send_signal(signal, values):
     try:
         resp = requests.post(WEBHOOK_URL, json=payload, timeout=5)
         print(f"✅ Signal sent: {signal} @ {values['price']} → {resp.status_code}")
-        set_cooldown(signal)
     except Exception as e:
         print(f"❌ Failed to send signal: {e}")
 
@@ -145,8 +136,9 @@ def send_signal(signal, values):
 def main():
     print(f"🔍 Scanner started — checking {SYMBOL} every 60s")
     print(f"📡 Sending signals to: {WEBHOOK_URL}")
+    print(f"📊 RSI filter: {RSI_MIN}-{RSI_MAX}")
 
-    init_cooldown_table()
+    init_db_tables()
 
     while True:
         try:
@@ -155,29 +147,28 @@ def main():
             long_signal, short_signal, values = check_signals(df)
 
             if not values:
-                print("⚠️ Skipping — NaN in indicators")
                 time.sleep(60)
                 continue
 
             now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            print(f"[{now}] price={values['price']} ema9={values['ema9']} ema21={values['ema21']} vwap={values['vwap']} atr={values['atr']}")
+            print(f"[{now}] price={values['price']} ema9={values['ema9']} ema21={values['ema21']} vwap={values['vwap']} atr={values['atr']} rsi={values['rsi']}")
 
             if long_signal:
-                if is_on_cooldown("LONG"):
-                    pass  # message already printed in is_on_cooldown
-                else:
-                    print("🟢 LONG signal detected!")
-                    send_signal("LONG", values)
+                print("🟢 LONG signal detected!")
+                send_signal("LONG", values)
 
             elif short_signal:
-                if is_on_cooldown("SHORT"):
-                    pass
-                else:
-                    print("🔴 SHORT signal detected!")
-                    send_signal("SHORT", values)
+                print("🔴 SHORT signal detected!")
+                send_signal("SHORT", values)
 
             else:
-                print("— No signal")
+                rsi = values['rsi']
+                if rsi > RSI_MAX:
+                    print(f"— No signal (RSI {rsi} too high for LONG)")
+                elif rsi < RSI_MIN:
+                    print(f"— No signal (RSI {rsi} too low for SHORT)")
+                else:
+                    print("— No signal")
 
         except Exception as e:
             print(f"❌ Scanner error: {e}")

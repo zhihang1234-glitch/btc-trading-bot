@@ -224,7 +224,11 @@ def webhook():
     else:
         decision = "❌ SKIP"
 
-    atr_note = f"\nATR: `{atr}` → SL: `{sl}` | TP: `{tp}`" if atr else f"\nSL: `{sl}` | TP: `{tp}` _(fixed fallback)_"
+    rsi = safe_float(data.get("rsi"))
+    rsi_str = f"`{rsi}`" if rsi else "`N/A`"
+    atr_note = f"\nRSI: {rsi_str} | ATR: `{atr}`\nSL: `{sl}` | TP: `{tp}`" if atr else "\n⚠️ ATR missing — signal skipped"
+    if not atr:
+        return "ok"
 
     log_trade(data, score, features, sl, tp)
 
