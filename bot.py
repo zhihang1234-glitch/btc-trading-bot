@@ -9,15 +9,14 @@ import joblib
 import os
 import psycopg2
 import psycopg2.extras
-import psycopg2.pool
 from flask import Flask, request
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 # ===== CONFIG =====
 TOKEN = os.environ.get("DISCORD_TOKEN")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "1497320466715775080"))
 DATABASE_URL = os.environ.get("DATABASE_URL")
-MODEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.pkl")
+MODEL_FILE = "model.pkl"
 PORT = int(os.environ.get("PORT", 5000))
 
 app = Flask(__name__)
@@ -25,43 +24,12 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# ===== CONNECTION POOL =====
-# FIX #3: Use a threaded connection pool instead of a new connection per call
-_pool = None
-
-def get_pool():
-    global _pool
-    if _pool is None:
-        _pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=1,
-            maxconn=10,
-            dsn=DATABASE_URL,
-            sslmode="require"
-        )
-    return _pool
-
-def get_conn():
-    return get_pool().getconn()
-
-def release_conn(conn):
-    get_pool().putconn(conn)
-
-# Context manager for cleaner usage
-class ManagedConn:
-    def __enter__(self):
-        self.conn = get_conn()
-        return self.conn
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is None:
-            self.conn.commit()
-        else:
-            self.conn.rollback()
-        release_conn(self.conn)
-        return False
-
 # ===== DATABASE =====
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
 def init_db():
-    with ManagedConn() as conn:
+    with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
@@ -77,13 +45,8 @@ def init_db():
                     features JSONB
                 )
             """)
-            # FIX: only add column if truly missing; avoid running ALTER on every boot
-            cur.execute("""
-                SELECT column_name FROM information_schema.columns
-                WHERE table_name='trades' AND column_name='atr'
-            """)
-            if not cur.fetchone():
-                cur.execute("ALTER TABLE trades ADD COLUMN atr FLOAT")
+            cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS atr FLOAT")
+        conn.commit()
     print("✅ DB initialized")
 
 def log_trade(data, score, features, sl, tp):
@@ -91,38 +54,25 @@ def log_trade(data, score, features, sl, tp):
     signal = data["signal"]
     atr = float(data.get("atr", 0))
 
-    with ManagedConn() as conn:
+    with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO trades (signal, entry, sl, tp, atr, score, features)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (signal, entry, sl, tp, atr, score, json.dumps(features)))
+        conn.commit()
 
 def get_open_trades():
-    with ManagedConn() as conn:
+    with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM trades WHERE status = 'OPEN'")
             return cur.fetchall()
 
-def update_trade_status(trade_id, status, exit_price):
-    # FIX #7: store actual exit price so P&L is accurate
-    with ManagedConn() as conn:
+def update_trade_status(trade_id, status):
+    with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE trades SET status = %s, exit_price = %s WHERE id = %s",
-                (status, exit_price, trade_id)
-            )
-
-def ensure_exit_price_column():
-    """Ensure exit_price column exists for accurate P&L tracking."""
-    with ManagedConn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT column_name FROM information_schema.columns
-                WHERE table_name='trades' AND column_name='exit_price'
-            """)
-            if not cur.fetchone():
-                cur.execute("ALTER TABLE trades ADD COLUMN exit_price FLOAT")
+            cur.execute("UPDATE trades SET status = %s WHERE id = %s", (status, trade_id))
+        conn.commit()
 
 # ===== MODEL =====
 model = None
@@ -130,11 +80,10 @@ model = None
 def load_model():
     global model
     try:
-        # FIX: use absolute path so working directory doesn't matter
         model = joblib.load(MODEL_FILE)
         print("✅ Model loaded")
     except Exception as e:
-        print(f"⚠️ No model found at {MODEL_FILE}: {e}")
+        print(f"⚠️ No model found: {e}")
         model = None
 
 # ===== PRICE =====
@@ -154,13 +103,24 @@ def safe_float(val):
         return None
 
 # ===== ATR-BASED SL/TP =====
+# Stop/target as multiples of ATR. Changed from 1.5/2.5 after backtesting
+# 300 days of 1h candles: every 2.0x row beat every 1.5x row, which beat every
+# 1.0x row, and 2.0x/4.0x held positive in 3 of 4 quarters (Q1 Oct-Jan was flat
+# at +0.000R). Expect roughly +0.2R/trade BEFORE fees and slippage, which the
+# backtest did not model. Re-run backtest.py before changing these again.
+SL_ATR_MULT = 2.0
+TP_ATR_MULT = 4.0
+
+
 def calculate_sl_tp(signal, entry, atr):
-    if atr and atr > 0:
-        sl_distance = atr * 1.5
-        tp_distance = atr * 2.5
-    else:
-        sl_distance = entry * 0.005
-        tp_distance = entry * 0.01
+    # No silent percentage fallback. A fixed-% stop is a different strategy
+    # from the one that was tested, and mixing the two quietly corrupts the
+    # trade log that future backtests depend on. Callers must skip the signal.
+    if not atr or atr <= 0:
+        return None, None
+
+    sl_distance = atr * SL_ATR_MULT
+    tp_distance = atr * TP_ATR_MULT
 
     if signal == "LONG":
         sl = entry - sl_distance
@@ -239,24 +199,6 @@ def ml_predict(features, score):
     ]]
     return model.predict_proba(X)[0][1]
 
-# ===== DISCORD SEND HELPER =====
-# FIX #2 & #4: safe wrapper that checks client.is_ready() before using the loop
-def send_discord(msg):
-    if not client.is_ready():
-        print("⚠️ Discord not ready, dropping message")
-        return
-    ch = client.get_channel(CHANNEL_ID)
-    if ch is None:
-        print("❌ CHANNEL NOT FOUND")
-        return
-    future = asyncio.run_coroutine_threadsafe(ch.send(msg), client.loop)
-    try:
-        # FIX #1: wait for the coroutine to complete so failures surface
-        future.result(timeout=10)
-        print("✅ MESSAGE SENT")
-    except Exception as e:
-        print(f"❌ Discord send failed: {e}")
-
 # ===== WEBHOOK =====
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -272,27 +214,20 @@ def webhook():
     if not data:
         return "empty", 400
 
-    # FIX #8: validate signal field before doing anything
-    signal = data.get("signal")
-    if signal not in ("LONG", "SHORT"):
-        print(f"❌ Invalid signal: {signal!r}")
-        return "invalid signal", 400
-
-    entry = safe_float(data.get("price"))
-    # FIX #8: validate price
-    if entry is None:
-        print("❌ Missing or invalid price")
-        return "invalid price", 400
-
-    atr = safe_float(data.get("atr"))
-
-    if not atr:
-        print("⚠️ ATR missing — signal skipped")
-        return "ok"
-
     print("WEBHOOK RECEIVED:", data)
 
+    entry = safe_float(data.get("price"))
+    atr = safe_float(data.get("atr"))
+    signal = data.get("signal")
+
+    # Bail out before logging or alerting. Without a valid ATR we cannot size
+    # the stop the way the backtest assumed, and a substituted fixed-% stop
+    # would pollute the trade history that future backtests read.
     sl, tp = calculate_sl_tp(signal, entry, atr)
+    if sl is None or entry is None:
+        print(f"⚠️ Skipping {signal}: invalid ATR ({atr}) or price ({entry})")
+        return "skipped: no atr", 200
+
     score = evaluate_trade(data)
     features = build_features(data)
     prob = ml_predict(features, score)
@@ -308,7 +243,10 @@ def webhook():
 
     rsi = safe_float(data.get("rsi"))
     rsi_str = f"`{rsi}`" if rsi else "`N/A`"
-
+    risk = round(abs(entry - sl), 2)
+    atr_note = (f"\nRSI: {rsi_str} | ATR: `{atr}`"
+                f"\nSL: `{sl}` | TP: `{tp}`"
+                f"\nRisk: `{risk}` pts — size so this is a constant % of account")
     log_trade(data, score, features, sl, tp)
 
     msg = (
@@ -316,13 +254,17 @@ def webhook():
         f"**{signal}** @ `{entry}`\n\n"
         f"Score: `{score}/100`\n"
         f"ML Prob: `{round(prob * 100, 2) if prob else 'N/A'}%`\n"
-        f"Decision: {decision}\n"
-        f"RSI: {rsi_str} | ATR: `{atr}`\n"
-        f"SL: `{sl}` | TP: `{tp}`"
+        f"Decision: {decision}"
+        f"{atr_note}"
     )
 
     print("SENDING TO DISCORD...")
-    send_discord(msg)
+    ch = client.get_channel(CHANNEL_ID)
+    if ch is None:
+        print("❌ CHANNEL NOT FOUND")
+    else:
+        asyncio.run_coroutine_threadsafe(ch.send(msg), client.loop)
+        print("✅ MESSAGE SENT")
 
     return "ok"
 
@@ -339,7 +281,7 @@ async def on_message(message):
     # !status
     if message.content == "!status":
         try:
-            with ManagedConn() as conn:
+            with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'")
                     open_count = cur.fetchone()[0]
@@ -384,10 +326,10 @@ async def on_message(message):
         except Exception as e:
             await message.channel.send(f"❌ DB error: {e}")
 
-    # !pnl — FIX #7: use actual exit_price instead of tp/sl
+    # !pnl
     elif message.content == "!pnl":
         try:
-            with ManagedConn() as conn:
+            with get_conn() as conn:
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute("SELECT * FROM trades WHERE status IN ('WIN', 'LOSS')")
                     closed = cur.fetchall()
@@ -398,15 +340,16 @@ async def on_message(message):
 
             total_pnl = 0
             for t in closed:
-                exit_price = t.get("exit_price")
-                if exit_price is None:
-                    # fallback for trades closed before this fix
-                    exit_price = t["tp"] if t["status"] == "WIN" else t["sl"]
-
-                if t["signal"] == "LONG":
-                    total_pnl += exit_price - t["entry"]
+                if t["status"] == "WIN":
+                    if t["signal"] == "LONG":
+                        total_pnl += t["tp"] - t["entry"]
+                    else:
+                        total_pnl += t["entry"] - t["tp"]
                 else:
-                    total_pnl += t["entry"] - exit_price
+                    if t["signal"] == "LONG":
+                        total_pnl += t["sl"] - t["entry"]
+                    else:
+                        total_pnl += t["entry"] - t["sl"]
 
             emoji = "🟢" if total_pnl >= 0 else "🔴"
             await message.channel.send(
@@ -419,7 +362,7 @@ async def on_message(message):
     # !history
     elif message.content == "!history":
         try:
-            with ManagedConn() as conn:
+            with get_conn() as conn:
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute("SELECT * FROM trades WHERE status IN ('WIN','LOSS') ORDER BY time DESC LIMIT 10")
                     trades = cur.fetchall()
@@ -461,15 +404,16 @@ def monitor():
                         new_status = "LOSS"
 
                 if new_status:
-                    # FIX #7: pass actual current price as exit price
-                    update_trade_status(t["id"], new_status, exit_price=price)
+                    update_trade_status(t["id"], new_status)
                     emoji = "🟢" if new_status == "WIN" else "🔴"
                     msg = (
                         f"{emoji} **Trade Closed — {new_status}**\n"
                         f"{t['signal']} | Entry: `{t['entry']}` | Exit: `{price}`\n"
                         f"SL was `{t['sl']}` | TP was `{t['tp']}`"
                     )
-                    send_discord(msg)
+                    ch = client.get_channel(CHANNEL_ID)
+                    if ch:
+                        asyncio.run_coroutine_threadsafe(ch.send(msg), client.loop)
 
         except Exception as e:
             print(f"Monitor error: {e}")
@@ -477,23 +421,16 @@ def monitor():
         time.sleep(10)
 
 # ===== DAILY SUMMARY =====
-# FIX #5: guard flag so on_ready reconnects don't spawn duplicate tasks
-_summary_started = False
-
 async def daily_summary():
     await client.wait_until_ready()
     while True:
         now = datetime.now(timezone.utc)
-
-        # FIX #6: compute next midnight correctly regardless of start time
-        next_midnight = (now + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        seconds_until_midnight = (next_midnight - now).total_seconds()
+        # Wait until next midnight UTC
+        seconds_until_midnight = ((24 - now.hour) * 3600) - (now.minute * 60) - now.second
         await asyncio.sleep(seconds_until_midnight)
 
         try:
-            with ManagedConn() as conn:
+            with get_conn() as conn:
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute("""
                         SELECT * FROM trades
@@ -524,12 +461,8 @@ async def daily_summary():
 # ===== STARTUP =====
 @client.event
 async def on_ready():
-    global _summary_started
     print(f"✅ Bot ready: {client.user}")
-    # FIX #5: only start once even if on_ready fires multiple times
-    if not _summary_started:
-        _summary_started = True
-        client.loop.create_task(daily_summary())
+    client.loop.create_task(daily_summary())
 
 def run_flask():
     app.run(host="0.0.0.0", port=PORT)
@@ -537,7 +470,6 @@ def run_flask():
 if __name__ == "__main__":
     load_model()
     init_db()
-    ensure_exit_price_column()
 
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=monitor, daemon=True).start()
