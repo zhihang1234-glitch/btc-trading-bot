@@ -24,14 +24,47 @@ def get_conn():
 def init_db_tables():
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # Records the last candle we acted on. Stored in Postgres, not in
+            # memory, so a Railway restart cannot replay a candle already traded.
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS cooldowns (
-                    signal TEXT PRIMARY KEY,
-                    last_fired TIMESTAMP
+                CREATE TABLE IF NOT EXISTS scanner_state (
+                    key TEXT PRIMARY KEY,
+                    value BIGINT
                 )
+            """)
+            cur.execute("""
+                INSERT INTO scanner_state (key, value) VALUES ('last_candle', 0)
+                ON CONFLICT (key) DO NOTHING
             """)
         conn.commit()
     print("✅ DB tables ready")
+
+
+def get_last_candle():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM scanner_state WHERE key = 'last_candle'")
+            row = cur.fetchone()
+            return row[0] if row else 0
+
+
+def set_last_candle(candle_time):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO scanner_state (key, value) VALUES ('last_candle', %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, (candle_time,))
+        conn.commit()
+
+
+def has_open_trade():
+    """The backtest holds one position at a time. Live must do the same, or the
+    two are not the same strategy and the backtested expectancy does not apply."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM trades WHERE status = 'OPEN'")
+            return cur.fetchone()[0] > 0
 
 # ===== FETCH CANDLES =====
 def get_candles():
@@ -85,7 +118,15 @@ def calculate_indicators(df):
 
 # ===== SIGNAL CHECK =====
 def check_signals(df):
-    latest = df.iloc[-1]
+    # iloc[-1] is the CURRENTLY FORMING candle — its close, volume and RSI all
+    # keep changing until the hour ends. The backtest evaluates closed candles
+    # only, so using [-1] live means testing one strategy and trading another.
+    # iloc[-2] is the last fully closed candle.
+    if len(df) < 2:
+        return False, False, {}
+
+    latest = df.iloc[-2]
+    candle_time = int(latest["time"])
 
     close = latest["close"]
     ema9 = latest["ema9"]
@@ -122,6 +163,7 @@ def check_signals(df):
     )
 
     return long_signal, short_signal, {
+        "candle_time": candle_time,
         "price": round(close, 2),
         "ema9": round(ema9, 2),
         "ema21": round(ema21, 2),
@@ -133,7 +175,8 @@ def check_signals(df):
 
 # ===== SEND SIGNAL =====
 def send_signal(signal, values):
-    payload = {"signal": signal, **values}
+    payload = {"signal": signal,
+               **{k: v for k, v in values.items() if k != "candle_time"}}
     try:
         resp = requests.post(WEBHOOK_URL, json=payload, timeout=5)
         print(f"✅ Signal sent: {signal} @ {values['price']} → {resp.status_code}")
@@ -159,24 +202,38 @@ def main():
                 continue
 
             now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            print(f"[{now}] price={values['price']} ema9={values['ema9']} ema21={values['ema21']} vwap={values['vwap']} atr={values['atr']} rsi={values['rsi']}")
+            candle_time = values["candle_time"]
+            candle_str = datetime.fromtimestamp(candle_time, timezone.utc).strftime("%m-%d %H:%M")
+            print(f"[{now}] candle={candle_str} price={values['price']} "
+                  f"ema9={values['ema9']} ema21={values['ema21']} "
+                  f"vwap={values['vwap']} atr={values['atr']} rsi={values['rsi']}")
 
-            if long_signal:
-                print("🟢 LONG signal detected!")
-                send_signal("LONG", values)
+            if not (long_signal or short_signal):
+                print("— No signal")
+                time.sleep(60)
+                continue
 
-            elif short_signal:
-                print("🔴 SHORT signal detected!")
-                send_signal("SHORT", values)
+            direction = "LONG" if long_signal else "SHORT"
 
-            else:
-                rsi = values['rsi']
-                if rsi > RSI_MAX:
-                    print(f"— No signal (RSI {rsi} too high for LONG)")
-                elif rsi < RSI_MIN:
-                    print(f"— No signal (RSI {rsi} too low for SHORT)")
-                else:
-                    print("— No signal")
+            # GATE 1: one entry per closed candle. Without this the same candle
+            # re-fires every 60s for the whole hour — that is what logged ~150
+            # duplicate trades in three hours.
+            if candle_time <= get_last_candle():
+                print(f"⏸️  {direction} already handled for candle {candle_str}")
+                time.sleep(60)
+                continue
+
+            # GATE 2: one position at a time, matching the backtest.
+            if has_open_trade():
+                print(f"⏸️  {direction} skipped — a position is already open")
+                set_last_candle(candle_time)
+                time.sleep(60)
+                continue
+
+            emoji = "🟢" if long_signal else "🔴"
+            print(f"{emoji} {direction} signal detected on closed candle {candle_str}")
+            send_signal(direction, values)
+            set_last_candle(candle_time)
 
         except Exception as e:
             print(f"❌ Scanner error: {e}")
